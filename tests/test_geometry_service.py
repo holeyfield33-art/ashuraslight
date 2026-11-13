@@ -6,7 +6,7 @@ Does not weaken existing CSPICE oracle tolerances.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import pytest
@@ -14,6 +14,7 @@ import pytest
 from geometry.contract import InstantRequest, WindowRequest
 from geometry.service import GeometryService
 from sites import get_site_by_id
+from ephemeris import GeometryInputError
 
 ROOT = Path(__file__).resolve().parents[1]
 KERNEL_DIR = ROOT / "data" / "kernels"
@@ -127,7 +128,6 @@ def test_instant_provenance_and_limitations(service: GeometryService) -> None:
 
 
 def test_instant_subsolar_fields_are_explicitly_unavailable(service: GeometryService) -> None:
-    """Placeholder audit: must not present zeros as real geometry."""
     site = get_site_by_id("DM2-358")
     req = InstantRequest(
         latitude_deg=site.latitude_deg,
@@ -231,3 +231,68 @@ def test_window_first_state_change_type(service: GeometryService) -> None:
         assert summary.hours_to_sun_state_change > 0
     if summary.hours_to_earth_state_change is not None:
         assert summary.hours_to_earth_state_change > 0
+
+
+def test_window_rejects_duration_over_30_days(service: GeometryService) -> None:
+    site = get_site_by_id("DM2-358")
+    with pytest.raises(GeometryInputError, match="30"):
+        service.window(
+            WindowRequest(
+                latitude_deg=site.latitude_deg,
+                longitude_deg=site.longitude_deg,
+                start_utc=FIXED_EPOCH,
+                duration_days=31.0,
+                step_hours=1.0,
+                site_id=site.site_id,
+            )
+        )
+
+
+def test_window_24h_with_7h_step_includes_endpoint(service: GeometryService) -> None:
+    """Regression: 24 h window, 7 h step → 0,7,14,21,24 h (final interval shorter)."""
+    site = get_site_by_id("DM2-358")
+    summary = service.window(
+        WindowRequest(
+            latitude_deg=site.latitude_deg,
+            longitude_deg=site.longitude_deg,
+            start_utc=FIXED_EPOCH,
+            duration_days=1.0,
+            step_hours=7.0,
+            site_id=site.site_id,
+        )
+    )
+    offsets = [s.offset_hours for s in summary.series]
+    assert offsets[0] == pytest.approx(0.0)
+    assert offsets[-1] == pytest.approx(24.0)
+    assert offsets == pytest.approx([0.0, 7.0, 14.0, 21.0, 24.0])
+    assert len(summary.series) == 5
+
+
+def test_instant_rejects_naive_timestamp(service: GeometryService) -> None:
+    naive = datetime(2026, 12, 1, 0, 0)
+    with pytest.raises(GeometryInputError, match="timezone-aware|UTC"):
+        service.instant(
+            InstantRequest(latitude_deg=-84.0, longitude_deg=60.0, epoch_utc=naive)
+        )
+
+
+def test_instant_rejects_non_utc_offset(service: GeometryService) -> None:
+    non_utc = datetime(2026, 12, 1, 0, 0, tzinfo=timezone(timedelta(hours=-8)))
+    with pytest.raises(GeometryInputError, match="UTC|offset"):
+        service.instant(
+            InstantRequest(latitude_deg=-84.0, longitude_deg=60.0, epoch_utc=non_utc)
+        )
+
+
+def test_window_rejects_non_utc_offset(service: GeometryService) -> None:
+    non_utc = datetime(2026, 12, 1, 0, 0, tzinfo=timezone(timedelta(hours=5)))
+    with pytest.raises(GeometryInputError, match="UTC|offset"):
+        service.window(
+            WindowRequest(
+                latitude_deg=-84.0,
+                longitude_deg=60.0,
+                start_utc=non_utc,
+                duration_days=1.0,
+                step_hours=1.0,
+            )
+        )

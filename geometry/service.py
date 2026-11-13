@@ -88,9 +88,28 @@ class GeometryService:
     def close(self) -> None:
         self._geom.close()
 
+    @staticmethod
+    def _require_utc(dt: datetime, field_name: str) -> datetime:
+        """Reject naive timestamps and non-UTC offsets. Accept only UTC-aware values."""
+        if dt.tzinfo is None:
+            raise GeometryInputError(f"{field_name} must be timezone-aware UTC")
+        offset = dt.utcoffset()
+        if offset is None or offset.total_seconds() != 0:
+            raise GeometryInputError(
+                f"{field_name} must use UTC (offset 0); got offset {offset}"
+            )
+        return dt
+
     def instant(self, request: InstantRequest) -> InstantGeometry:
-        if request.epoch_utc.tzinfo is None:
-            raise GeometryInputError("epoch_utc must be timezone-aware UTC")
+        epoch = self._require_utc(request.epoch_utc, "epoch_utc")
+        if epoch is not request.epoch_utc:
+            request = InstantRequest(
+                latitude_deg=request.latitude_deg,
+                longitude_deg=request.longitude_deg,
+                epoch_utc=epoch,
+                horizon_mask_deg=request.horizon_mask_deg,
+                site_id=request.site_id,
+            )
         site = _site_from_request(
             request.latitude_deg, request.longitude_deg, request.site_id
         )
@@ -142,16 +161,29 @@ class GeometryService:
         )
 
     def window(self, request: WindowRequest) -> WindowSummary:
-        if request.start_utc.tzinfo is None:
-            raise GeometryInputError("start_utc must be timezone-aware UTC")
+        start = self._require_utc(request.start_utc, "start_utc")
         if request.duration_days <= 0 or request.step_hours <= 0:
             raise GeometryInputError("duration_days and step_hours must be positive")
+        if request.duration_days > 30.0:
+            raise GeometryInputError(
+                "duration_days must be <= 30 (Tier-1 maximum analysis window)"
+            )
 
-        step = timedelta(hours=request.step_hours)
-        n_steps = int(request.duration_days * 24 / request.step_hours)
-        timestamps = tuple(
-            request.start_utc + i * step for i in range(n_steps + 1)
-        )
+        # Sampling convention (documented):
+        # Fixed step from start. The final sample is always the exact window end.
+        # If duration is not an integer multiple of step, the last interval is shorter.
+        # Example: 24 h window, 7 h step → stamps at 0, 7, 14, 21, 24 h (5 samples).
+        total_hours = request.duration_days * 24.0
+        step_h = float(request.step_hours)
+        timestamps_list: list[datetime] = []
+        t = 0.0
+        while t < total_hours - 1e-12:
+            timestamps_list.append(start + timedelta(hours=t))
+            t += step_h
+        end_stamp = start + timedelta(hours=total_hours)
+        if not timestamps_list or timestamps_list[-1] != end_stamp:
+            timestamps_list.append(end_stamp)
+        timestamps = tuple(timestamps_list)
 
         site = _site_from_request(
             request.latitude_deg, request.longitude_deg, request.site_id
@@ -175,10 +207,11 @@ class GeometryService:
             earth_state, _ = classify_earth_visibility(earth_el, earth_clear)
             earth_agg = earth_state in ("VISIBLE", "GRAZING")
 
+            offset_h = (ts - start).total_seconds() / 3600.0
             samples.append(
                 WindowSample(
-                    offset_hours=i * request.step_hours,
-                    offset_days=(i * request.step_hours) / 24.0,
+                    offset_hours=offset_h,
+                    offset_days=offset_h / 24.0,
                     epoch_utc=ts,
                     sun_elevation_deg=sun_el,
                     sun_azimuth_deg=sun_az,
@@ -203,7 +236,6 @@ class GeometryService:
         sunlight_count = sum(sun_disk_flags)
         earth_count = sum(earth_vis_flags)
         simultaneous_count = sum(simultaneous_flags)
-        total_hours = request.duration_days * 24.0
 
         sunlight_pct = 100.0 * sunlight_count / n if n else 0.0
         earth_pct = 100.0 * earth_count / n if n else 0.0
